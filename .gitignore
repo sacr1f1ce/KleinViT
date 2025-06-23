@@ -1,6 +1,6 @@
 data
 models
-plan.md
+_*.md
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
