@@ -59,17 +59,15 @@ This phase has multiple approaches, ordered by increasing complexity.
 
 ### Approach A: Geometric Positional Encoding
 
-This is the simplest modification and a great starting point. Instead of modifying the attention mechanism itself, you just give the model information about the geometric coordinates.
+This is the simplest modification. Instead of modifying the attention mechanism itself, we just give the model information about the geometric coordinates.
 
 *   **Your New Input:**
-    1.  Take your geometric coordinates `gi = (θi, φi)`.
+    1.  Take the geometric coordinates `gi = (θi, φi)`.
     2.  Convert them into a fixed-size vector. Since they are angles, a good way to do this is `[sin(θi), cos(θi), sin(φi), cos(φi)]`. This respects their circular nature.
     3.  Project this small vector into the main embedding dimension D using a small learnable linear layer. Let's call this the `geometric_content_embedding`.
     4.  Your final input token is: `token = patch_embedding + spatial_positional_embedding + geometric_content_embedding`
 
 ### Approach B: Topological Attention
-
-This is the core of your idea and is more powerful. Here, you directly modify the attention calculation.
 
 *   **Concept:** Modify the attention scores to incorporate a bias based on the Klein bottle distance between patches.
 *   **Implementation:**
@@ -105,6 +103,4 @@ This is the most sophisticated method, allowing the model to decide how much to 
     *   Training speed and convergence.
     *   Data efficiency (performance on smaller subsets of the training data).
 *   **Analysis:**
-    *   **Rotation Robustness:** Test the model's performance on rotated versions of test images. The KleinViT should theoretically be more robust.
-    *   **Attention Visualization:** Visualize attention maps. Do they show that patches with similar geometric properties attend to each other?
-    *   **Learned Parameters:** Analyze the learned parameters like `α` (from Approach B) and the gate activations `γ` (from Approach C) to understand if and when the model is using the geometric information.
+    * **ADD**
