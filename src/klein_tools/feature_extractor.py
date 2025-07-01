@@ -1,170 +1,141 @@
 import torch
-import torch.nn.functional as F
 import numpy as np
 
 
 class KleinFeatureExtractor:
-    """
-    A class to handle the extraction of Klein bottle features from image patches.
-    It creates a Gabor filter bank and uses it to project image patches to
-    a feature space, representing each patch with Klein bottle coordinates
-    (theta, phi).
+    """Feature extractor that maps image patches to Klein bottle coordinates
+    using a bank of analytical Klein filters.
     """
 
-    def __init__(self, patch_size=3, num_orientations=16, device='cpu'):
-        self.patch_size = patch_size
-        self.num_orientations = num_orientations
-        self.device = device
-        self.orientations = torch.arange(
-            num_orientations, device=device
-        ) * (np.pi / num_orientations)
-
-        gabor_kernels_complex = [
-            self._create_gabor_kernel(th, 0.6, 0.5, patch_size, device)
-            for th in self.orientations
-        ]
-
-        # We use the real part of the Gabor filters for our projection
-        self.gabor_kernels = torch.stack(
-            [torch.real(k) for k in gabor_kernels_complex], dim=0
-        ).unsqueeze(1)  # Shape: (num_orientations, 1, patch_size, patch_size)
-
-        # Ensure kernels are on the correct device
-        self.gabor_kernels = self.gabor_kernels.to(device)
-
-    def get_klein_coordinates(self, image_batch):
-        """
-        Extracts Klein bottle coordinates (theta, phi) for each patch in a
-        batch of images.
+    def __init__(self, patch_size: int = 3, num_angles: int = 4,
+                 device: str = "cpu") -> None:
+        """Create a bank of Klein filters.
 
         Args:
-            image_batch (torch.Tensor): A batch of images of shape
-                                        (b, c, h, w).
-
-        Returns:
-            torch.Tensor: A tensor of shape (b, num_patches, 2) containing
-                          the (theta, phi) coordinates for each patch.
+            patch_size: Size of each square patch / filter.
+            num_angles: Number of discrete angles per axis. Total
+                filters = num_angles ** 2 (matches KF_Layer where
+                ``angle = int(sqrt(slices))``).
+            device: Target torch device string.
         """
-        b, c, h, w = image_batch.shape
+        self.patch_size = patch_size
+        self.num_angles = num_angles
+        self.device = torch.device(device)
+
+        # Angular grids matching implementation in `topological_conv_layer`.
+        # Values are evenly spaced but *exclude* the end-point (π or 2π),
+        # because the original code uses `range(angle)` rather than
+        # `linspace`. This ensures we generate exactly the same orientations
+        # as in `KF_Layer` / `generate_klein_filter`.
+        thetas1 = (torch.arange(num_angles, device=self.device)
+                   * (np.pi / num_angles))
+        thetas2 = (torch.arange(num_angles, device=self.device)
+                   * (2.0 * np.pi / num_angles))
+
+        kernels, theta_pairs = [], []
+        for theta2 in thetas2:
+            for theta1 in thetas1:
+                k = self._generate_klein_filter(theta1, theta2)
+                # Zero-mean / unit-variance for projection similarity.
+                k = (k - k.mean()) / (k.std() + 1e-6)
+                kernels.append(k)
+                theta_pairs.append(torch.tensor([theta1, theta2],
+                                                device=self.device))
+
+        self.klein_kernels = torch.stack(kernels).unsqueeze(1)  # (F,1,p,p)
+        self.thetas = torch.stack(theta_pairs)                  # (F,2)
+        self.num_filters = self.klein_kernels.shape[0]
+
+        # Flattened view for fast projection
+        self._kernels_flat = self.klein_kernels.view(
+            self.num_filters, -1).t()  # (p*p, F)
+
+    # ---------------------------------------------------------------------
+    # Public API
+    # ---------------------------------------------------------------------
+    def get_klein_coordinates(self, image_batch: torch.Tensor) -> torch.Tensor:
+        """Return (theta1, theta2) for every non-overlapping patch.
+
+        Args:
+            image_batch: (B, C, H, W) tensor in [0,1].
+        Returns:
+            Tensor of shape (B, N, 2) where N = num patches per image.
+        """
+        patches_ac_flat = self._extract_patches_ac_flat(image_batch)
+        similarities = torch.matmul(
+            patches_ac_flat, self._kernels_flat)  # (B,N,F)
+        best_idx = torch.argmax(torch.abs(similarities),
+                                dim=-1)          # (B,N)
+        # (B,N,2)
+        coords = self.thetas[best_idx]
+        return coords
+
+    def replace_patches_with_klein(self, image: torch.Tensor) -> torch.Tensor:
+        """Return grayscale image where each patch is replaced by the
+        closest Klein filter from the bank.
+        """
+        patches_ac_flat = self._extract_patches_ac_flat(
+            image.unsqueeze(0))  # (1,N,p*p)
+        similarities = torch.matmul(
+            patches_ac_flat, self._kernels_flat)     # (1,N,F)
+        best_idx = torch.argmax(torch.abs(similarities),
+                                dim=-1).squeeze(0)  # (N,)
+        selected = self.klein_kernels[best_idx].squeeze(1)  # (N,p,p)
+
+        # Scale filters to [0,1] for visualization
+        min_val = selected.amin(dim=(-2, -1), keepdim=True)
+        max_val = selected.amax(dim=(-2, -1), keepdim=True)
+        selected_norm = (selected - min_val) / (max_val - min_val + 1e-6)
+
+        # Reassemble image
+        c, h, w = image.shape
         p = self.patch_size
+        num_h, num_w = h // p, w // p
+        assembled = selected_norm.view(num_h, num_w, p, p)
+        assembled = assembled.permute(0, 2, 1, 3).contiguous().view(h, w)
+        return assembled.cpu()
 
-        # 1. Decompose image into patches
-        patches = image_batch.unfold(2, p, p).unfold(3, p, p)
-        patches = patches.permute(0, 2, 3, 1, 4, 5).contiguous()
-        patches = patches.view(b, -1, c, p, p)  # (b, num_patches, c, p, p)
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _extract_patches_ac_flat(self, images: torch.Tensor) -> torch.Tensor:
+        """Return zero-mean flattened grayscale patches."""
+        device = self.device
+        images = images.to(device)
+        b, c, h, w = images.shape
+        p = self.patch_size
+        patches = images.unfold(2, p, p).unfold(3, p, p)
+        patches = patches.permute(0, 2, 3, 1, 4, 5).contiguous()  # (B,N,C,p,p)
+        patches_gray = patches.mean(dim=3, keepdim=True)  # (B,N,1,p,p)
 
-        # Convert patches to grayscale for Gabor projection
-        # (b, num_patches, 1, p, p)
-        patches_gray = patches.mean(dim=2, keepdim=True)
-
-        # 2. Decompose patches into AC components
-        patch_means = patches_gray.mean(dim=(-3, -2, -1), keepdim=True)
+        # Zero-mean per patch
+        patch_means = patches_gray.mean(dim=(-1, -2, -3), keepdim=True)
         patches_ac = patches_gray - patch_means
 
-        # Flatten for matmul
-        # The new channel dim is 1
-        patches_ac_flat = patches_ac.view(
-            b, -1, 1 * p * p)  # (b, num_patches, p*p)
-        kernels_flat = self.gabor_kernels.view(
-            self.num_orientations, -1
-        ).t()  # (p*p, num_orientations)
+        # Unit-std (avoid division by zero)
+        patch_std = patches_ac.flatten(-3).std(dim=-1, keepdim=True)
+        patch_std = (patch_std
+                     .unsqueeze(-1)
+                     .unsqueeze(-1))  # (B,N,1,1,1)
+        patches_norm = patches_ac / (patch_std + 1e-6)
 
-        # 3. Project AC components onto Gabor filters
-        projection_magnitudes = torch.matmul(
-            patches_ac_flat, kernels_flat
-        )  # (b, num_patches, num_orientations)
+        return patches_norm.view(b, -1, p * p)
 
-        # 4. Find the best orientation (theta) for each patch
-        best_kernel_indices = torch.argmax(
-            projection_magnitudes, dim=-1
-        )  # (b, num_patches)
-        theta = self.orientations[best_kernel_indices]  # (b, num_patches)
+    def _generate_klein_filter(self, theta1: torch.Tensor,
+                               theta2: torch.Tensor) -> torch.Tensor:
+        """Generate one Klein filter on a regular grid (approx.)."""
+        p = self.patch_size
+        y = torch.linspace(-1.0, 1.0, steps=p, device=self.device)
+        x = torch.linspace(-1.0, 1.0, steps=p, device=self.device)
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
 
-        # 5. Determine the phase (phi) for each patch
-        best_projection_magnitudes = torch.gather(
-            projection_magnitudes, 2, best_kernel_indices.unsqueeze(-1)
-        ).squeeze(-1)  # (b, num_patches)
+        def _Q(t):
+            return (2 * t) ** 2 - 1
 
-        patch_ac_norms = torch.norm(
-            patches_ac_flat, dim=-1)  # (b, num_patches)
-
-        # Clamp for numerical stability
-        cosine_of_phi = torch.clamp(
-            best_projection_magnitudes / (patch_ac_norms + 1e-9), -1.0, 1.0
+        klein_val = (
+            torch.sin(theta2)
+            * (torch.cos(theta1) * xx + torch.sin(theta1) * yy)
+            + torch.cos(theta2)
+            * _Q(torch.cos(theta1) * xx + torch.sin(theta1) * yy)
         )
-        phi = torch.acos(cosine_of_phi)  # (b, num_patches)
-
-        # 6. Stack coordinates
-        klein_coords = torch.stack([theta, phi], dim=-1)
-
-        return klein_coords
-
-    def _create_gabor_kernel(self, theta, frequency, sigma, kernel_size, device):
-        y, x = torch.meshgrid(
-            torch.arange(-kernel_size // 2 + 1,
-                         kernel_size // 2 + 1, device=device),
-            torch.arange(-kernel_size // 2 + 1,
-                         kernel_size // 2 + 1, device=device),
-            indexing='ij'
-        )
-        x_theta = x * torch.cos(theta) + y * torch.sin(theta)
-        y_theta = -x * torch.sin(theta) + y * torch.cos(theta)
-
-        gb = torch.exp(-.5 * (x_theta ** 2 / sigma ** 2 + y_theta ** 2 / sigma ** 2)) * \
-            torch.exp(1j * 2 * np.pi * frequency * x_theta)
-        return (gb - gb.mean()) / gb.std()
-
-
-def reconstruct_patch_from_gabor(patch, extractor):
-    """
-    Reconstructs a single image patch using the Gabor filter bank from the
-    feature extractor. This function is mostly for visualization.
-    """
-    # Decompose into DC (brightness) and AC (texture)
-    dc_component = patch.mean()
-    ac_component = patch - dc_component
-
-    # Flatten for projection
-    ac_component_flat = ac_component.flatten()
-
-    # Project onto Gabor filters
-    kernels_flat = extractor.gabor_kernels.view(
-        extractor.num_orientations, -1
-    )
-    projection_magnitudes = torch.matmul(ac_component_flat, kernels_flat.t())
-
-    # Find best matching filter
-    best_kernel_idx = torch.argmax(projection_magnitudes)
-    best_kernel = kernels_flat[best_kernel_idx]
-    projection_on_best = projection_magnitudes[best_kernel_idx]
-
-    # Reconstruct the AC component
-    reconstructed_ac = best_kernel.view(patch.shape) * projection_on_best
-    reconstructed_ac_normalized = reconstruct_ac_from_texture(
-        patch, extractor
-    )
-
-    # Reconstruct the full patch
-    reconstructed_full = reconstructed_ac_normalized + dc_component
-    reconstructed_full = torch.clamp(reconstructed_full, 0, 1)
-
-    return reconstructed_ac_normalized, reconstructed_full
-
-
-def reconstruct_ac_from_texture(patch, extractor):
-    """Helper to reconstruct just the texture component."""
-    dc, ac = patch.mean(), patch - patch.mean()
-    ac_flat = ac.flatten()
-    kernels_flat = extractor.gabor_kernels.view(extractor.num_orientations, -1)
-    projections = torch.matmul(ac_flat, kernels_flat.t())
-    best_idx = torch.argmax(projections)
-    reconstructed_ac = kernels_flat[best_idx].view(
-        patch.shape) * projections[best_idx]
-
-    # Normalize for visualization
-    min_val, max_val = torch.min(reconstructed_ac), torch.max(reconstructed_ac)
-    if max_val > min_val:
-        final_patch_real = (reconstructed_ac - min_val) / (max_val - min_val)
-        return final_patch_real
-
-    return torch.zeros_like(reconstructed_ac)
+        return klein_val.float()

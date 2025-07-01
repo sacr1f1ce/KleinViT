@@ -7,28 +7,41 @@ from einops import rearrange
 from src.klein_tools.feature_extractor import KleinFeatureExtractor
 
 
-def visualize_gabor_kernels(extractor, save_path="output/gabor_kernels.png"):
+def visualize_klein_kernels(extractor, save_path="output/klein_kernels.png"):
     """
-    Visualizes the real parts of the Gabor filters in the extractor.
+    Visualizes the Klein filters in the extractor.
     """
-    n_orientations = extractor.num_orientations
-    cols = int(np.ceil(np.sqrt(n_orientations)))
-    rows = int(np.ceil(n_orientations / cols))
+    num_kernels = extractor.klein_kernels.shape[0]
+    num_angles = extractor.num_angles
 
-    fig, axes = plt.subplots(rows, cols, figsize=(cols * 2, rows * 2))
-    for i, ax in enumerate(axes.flat):
-        if i < len(extractor.gabor_kernels_complex):
-            # Visualize the real part of the complex kernel
-            kernel = torch.real(
-                extractor.gabor_kernels_complex[i]).cpu().numpy()
+    if num_kernels == 0:
+        print("No Klein kernels to visualize.")
+        return
+
+    fig, axes = plt.subplots(
+        num_angles, num_angles, figsize=(num_angles * 2, num_angles * 2)
+    )
+
+    # Ensure axes is always an iterable array
+    if num_kernels == 1:
+        axes_flat = [axes]
+    else:
+        axes_flat = axes.flat
+
+    for i, ax in enumerate(axes_flat):
+        if i < num_kernels:
+            kernel = extractor.klein_kernels[i].squeeze().cpu().numpy()
             ax.imshow(kernel, cmap='gray')
-            ax.set_title(f"{extractor.orientations[i].item():.2f}", fontsize=8)
+            theta1 = extractor.thetas[i, 0].item() / np.pi
+            theta2 = extractor.thetas[i, 1].item() / np.pi
+            ax.set_title(f"t1:{theta1:.1f}π t2:{theta2:.1f}π", fontsize=8)
         ax.set_xticks([])
         ax.set_yticks([])
-    fig.suptitle("Gabor Filter Bank (Real Parts)")
+
+    fig.suptitle("Klein Filter Bank")
     plt.tight_layout()
     plt.savefig(save_path, bbox_inches='tight')
-    print(f"Saved Gabor filter bank plot to {save_path}")
+    print(f"Saved Klein filter bank plot to {save_path}")
     plt.close()
 
 
